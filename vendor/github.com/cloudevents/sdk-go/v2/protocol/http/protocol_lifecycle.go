@@ -1,3 +1,8 @@
+/*
+ Copyright 2021 The CloudEvents Authors
+ SPDX-License-Identifier: Apache-2.0
+*/
+
 package http
 
 import (
@@ -8,8 +13,6 @@ import (
 	"strings"
 
 	"github.com/cloudevents/sdk-go/v2/protocol"
-	"go.opencensus.io/plugin/ochttp"
-	"go.opencensus.io/plugin/ochttp/propagation/tracecontext"
 )
 
 var _ protocol.Opener = (*Protocol)(nil)
@@ -28,18 +31,17 @@ func (p *Protocol) OpenInbound(ctx context.Context) error {
 		p.handlerRegistered = true
 	}
 
-	addr, err := p.listen()
+	// After listener is invok
+	listener, err := p.listen()
 	if err != nil {
 		return err
 	}
 
 	p.server = &http.Server{
-		Addr: addr.String(),
-		Handler: &ochttp.Handler{
-			Propagation:    &tracecontext.HTTPFormat{},
-			Handler:        attachMiddleware(p.Handler, p.middleware),
-			FormatSpanName: formatSpanName,
-		},
+		Addr:         listener.Addr().String(),
+		Handler:      attachMiddleware(p.Handler, p.middleware),
+		ReadTimeout:  DefaultTimeout,
+		WriteTimeout: DefaultTimeout,
 	}
 
 	// Shutdown
@@ -48,67 +50,76 @@ func (p *Protocol) OpenInbound(ctx context.Context) error {
 		p.server = nil
 	}()
 
-	errChan := make(chan error, 1)
+	errChan := make(chan error)
 	go func() {
-		errChan <- p.server.Serve(p.listener)
+		errChan <- p.server.Serve(listener)
 	}()
 
 	// wait for the server to return or ctx.Done().
 	select {
 	case <-ctx.Done():
-		// Try a gracefully shutdown.
+		// Try a graceful shutdown.
 		ctx, cancel := context.WithTimeout(context.Background(), p.ShutdownTimeout)
 		defer cancel()
-		err := p.server.Shutdown(ctx)
-		<-errChan // Wait for server goroutine to exit
-		return err
+
+		shdwnErr := p.server.Shutdown(ctx)
+		if shdwnErr != nil {
+			shdwnErr = fmt.Errorf("shutting down HTTP server: %w", shdwnErr)
+		}
+
+		// Wait for server goroutine to exit
+		rntmErr := <-errChan
+		if rntmErr != nil && rntmErr != http.ErrServerClosed {
+			rntmErr = fmt.Errorf("server failed during shutdown: %w", rntmErr)
+
+			if shdwnErr != nil {
+				return fmt.Errorf("combined error during shutdown of HTTP server: %w, %v",
+					shdwnErr, rntmErr)
+			}
+
+			return rntmErr
+		}
+
+		return shdwnErr
+
 	case err := <-errChan:
-		return err
+		if err != nil {
+			return fmt.Errorf("during runtime of HTTP server: %w", err)
+		}
+		return nil
 	}
 }
 
-// GetPort returns the listening port.
-// Returns -1 if there is a listening error.
-// Note this will call net.Listen() if  the listener is not already started.
-func (p *Protocol) GetPort() int {
-	// Ensure we have a listener and therefore a port.
-	if _, err := p.listen(); err == nil || p.Port != nil {
-		return *p.Port
+// GetListeningPort returns the listening port.
+// Returns -1 if it's not listening.
+func (p *Protocol) GetListeningPort() int {
+	if listener := p.listener.Load(); listener != nil {
+		if tcpAddr, ok := listener.(net.Listener).Addr().(*net.TCPAddr); ok {
+			return tcpAddr.Port
+		}
 	}
 	return -1
 }
 
-func formatSpanName(r *http.Request) string {
-	return "cloudevents.http." + r.URL.Path
-}
-
-func (p *Protocol) setPort(port int) {
-	if p.Port == nil {
-		p.Port = new(int)
-	}
-	*p.Port = port
-}
-
 // listen if not already listening, update t.Port
-func (p *Protocol) listen() (net.Addr, error) {
-	if p.listener == nil {
+func (p *Protocol) listen() (net.Listener, error) {
+	if p.listener.Load() == nil {
 		port := 8080
-		if p.Port != nil {
-			port = *p.Port
+		if p.Port != -1 {
+			port = p.Port
 			if port < 0 || port > 65535 {
 				return nil, fmt.Errorf("invalid port %d", port)
 			}
 		}
 		var err error
-		if p.listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port)); err != nil {
+		var listener net.Listener
+		if listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port)); err != nil {
 			return nil, err
 		}
+		p.listener.Store(listener)
+		return listener, nil
 	}
-	addr := p.listener.Addr()
-	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
-		p.setPort(tcpAddr.Port)
-	}
-	return addr, nil
+	return p.listener.Load().(net.Listener), nil
 }
 
 // GetPath returns the path the transport is hosted on. If the path is '/',
